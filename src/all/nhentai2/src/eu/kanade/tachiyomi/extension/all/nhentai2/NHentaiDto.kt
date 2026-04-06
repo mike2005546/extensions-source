@@ -38,7 +38,7 @@ data class GalleryListItem(
 ) {
     fun toSManga(thumbBase: String): SManga = SManga.create().apply {
         url = id.toString()
-        title = englishTitle
+        title = japaneseTitle ?: englishTitle
         thumbnail_url = "$thumbBase$thumbnail"
         status = SManga.COMPLETED
     }

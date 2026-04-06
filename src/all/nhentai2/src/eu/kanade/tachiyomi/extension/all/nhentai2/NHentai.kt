@@ -67,11 +67,15 @@ open class NHentai(
     // ─────────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request {
-        val url = "$apiUrl/galleries/popular".toHttpUrl().newBuilder().build()
+        val url = "$apiUrl/search".toHttpUrl().newBuilder().apply {
+            addQueryParameter("query", "*")
+            addQueryParameter("sort", "popular")
+            addQueryParameter("page", page.toString())
+        }.build()
         return GET(url, headers)
     }
 
-    override fun popularMangaParse(response: Response): MangasPage = parseGalleryArray(response)
+    override fun popularMangaParse(response: Response): MangasPage = parseGalleryList(response)
 
     // ─────────────────────────────────────────────────────────
     //  Latest Manga
@@ -163,7 +167,7 @@ open class NHentai(
 
         val finalQuery = parts.joinToString(" ").trim().ifEmpty { "*" }
 
-        val url = "$apiUrl/galleries".toHttpUrl().newBuilder().apply {
+        val url = "$apiUrl/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("query", finalQuery)
             addQueryParameter("sort", sortValue)
             addQueryParameter("page", page.toString())
@@ -179,19 +183,6 @@ open class NHentai(
             "en" -> 1
             "ja" -> 2
             "zh" -> 3
-            "ko" -> 4
-            "es" -> 5
-            "fr" -> 6
-            "de" -> 7
-            "pt" -> 8
-            "ru" -> 9
-            "th" -> 10
-            "vi" -> 11
-            "id" -> 12
-            "pl" -> 13
-            "ar" -> 14
-            "uk" -> 15
-            "tr" -> 16
             else -> 0
         },
     )

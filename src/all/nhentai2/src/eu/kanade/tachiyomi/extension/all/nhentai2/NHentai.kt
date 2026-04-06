@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.Request
 import okhttp3.Response
 import rx.Observable
@@ -34,6 +35,7 @@ open class NHentai(
         .newBuilder()
         // Respect the tightest documented limit: 45 req/min for gallery detail
         .rateLimit(permits = 3, period = 4)
+        .addInterceptor(DomainRetryInterceptor())
         .build()
 
     private val json: Json by injectLazy()
@@ -42,24 +44,15 @@ open class NHentai(
     //  CDN — lazily fetched, cached for the session
     // ─────────────────────────────────────────────────────────
 
-    private var cdnConfig: CdnConfigResponse? = null
+    // ─────────────────────────────────────────────────────────
+    //  CDN — stable defaults with subdomain retry
+    // ─────────────────────────────────────────────────────────
 
-    private fun getCdnConfig(): CdnConfigResponse = cdnConfig ?: run {
-        val response = client.newCall(GET("$apiUrl/config", headers)).execute()
-        val config = response.parseAs<CdnConfigResponse>()
-        cdnConfig = config
-        config
-    }
+    /** Returns the primary image CDN base URL. Defaults to i.nhentai.net. */
+    private fun imageBase(): String = "https://i.nhentai.net/"
 
-    /** Returns the primary image CDN base URL (with trailing slash already included if server ends with /).
-     *  Falls back to the known public CDN if the response is empty for any reason. */
-    private fun imageBase(): String = (getCdnConfig().imageServers.firstOrNull() ?: "https://cdn.nhentai.net").let {
-        if (it.endsWith("/")) it else "$it/"
-    }
-
-    private fun thumbBase(): String = (getCdnConfig().thumbServers.firstOrNull() ?: "https://t.nhentai.net").let {
-        if (it.endsWith("/")) it else "$it/"
-    }
+    /** Returns the primary thumbnail CDN base URL. Defaults to t.nhentai.net. */
+    private fun thumbBase(): String = "https://t.nhentai.net/"
 
     // ─────────────────────────────────────────────────────────
     //  Headers
@@ -74,15 +67,11 @@ open class NHentai(
     // ─────────────────────────────────────────────────────────
 
     override fun popularMangaRequest(page: Int): Request {
-        val url = "$apiUrl/galleries".toHttpUrl().newBuilder().apply {
-            if (searchLang.isNotBlank()) addQueryParameter("query", searchLang)
-            addQueryParameter("sort", "popular")
-            addQueryParameter("page", page.toString())
-        }.build()
+        val url = "$apiUrl/galleries/popular".toHttpUrl().newBuilder().build()
         return GET(url, headers)
     }
 
-    override fun popularMangaParse(response: Response): MangasPage = parseGalleryList(response)
+    override fun popularMangaParse(response: Response): MangasPage = parseGalleryArray(response)
 
     // ─────────────────────────────────────────────────────────
     //  Latest Manga
@@ -90,8 +79,6 @@ open class NHentai(
 
     override fun latestUpdatesRequest(page: Int): Request {
         val url = "$apiUrl/galleries".toHttpUrl().newBuilder().apply {
-            if (searchLang.isNotBlank()) addQueryParameter("query", searchLang)
-            addQueryParameter("sort", "date")
             addQueryParameter("page", page.toString())
         }.build()
         return GET(url, headers)
@@ -176,7 +163,7 @@ open class NHentai(
 
         val finalQuery = parts.joinToString(" ").trim().ifEmpty { "*" }
 
-        val url = "$apiUrl/search".toHttpUrl().newBuilder().apply {
+        val url = "$apiUrl/galleries".toHttpUrl().newBuilder().apply {
             addQueryParameter("query", finalQuery)
             addQueryParameter("sort", sortValue)
             addQueryParameter("page", page.toString())
@@ -258,10 +245,10 @@ open class NHentai(
     //  Page List
     // ─────────────────────────────────────────────────────────
 
-    override fun pageListRequest(chapter: SChapter): Request = GET("$apiUrl/galleries/${chapter.url}/pages", headers)
+    override fun pageListRequest(chapter: SChapter): Request = GET("$apiUrl/galleries/${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val pagesRes = response.parseAs<GalleryPagesResponse>()
+        val pagesRes = response.parseAs<GalleryDetailResponse>()
         val base = imageBase()
         return pagesRes.pages.map { pageInfo ->
             Page(
@@ -286,7 +273,68 @@ open class NHentai(
         return MangasPage(mangas, hasNextPage)
     }
 
+    private fun parseGalleryArray(response: Response): MangasPage {
+        val data = response.parseAs<List<GalleryListItem>>()
+        val thumb = thumbBase()
+        val mangas = data.map { it.toSManga(thumb) }
+        return MangasPage(mangas, false)
+    }
+
     private inline fun <reified T> Response.parseAs(): T = json.decodeFromString(body.string())
+
+    // ─────────────────────────────────────────────────────────
+    //  Interceptor
+    // ─────────────────────────────────────────────────────────
+
+    /** Interceptor to retry image and thumbnail requests across alternate subdomains on 404 error. */
+    private class DomainRetryInterceptor : Interceptor {
+        private val imgSubdomains = listOf("i", "i1", "i2", "i3", "i4")
+        private val thumbSubdomains = listOf("t", "t1", "t2", "t3", "t4")
+
+        override fun intercept(chain: Interceptor.Chain): Response {
+            val originalRequest = chain.request()
+            val response = chain.proceed(originalRequest)
+
+            if (response.code != 404) return response
+
+            val url = originalRequest.url
+            val host = url.host
+            if (!host.endsWith(".nhentai.net")) return response
+
+            val subdomains = when {
+                host.startsWith("i") -> imgSubdomains
+                host.startsWith("t") -> thumbSubdomains
+                else -> return response
+            }
+
+            // Extract the current prefix (e.g. "i3")
+            val currentPrefix = host.substringBefore(".")
+
+            // Try subsequent subdomains in the list
+            val currentIndex = subdomains.indexOf(currentPrefix)
+            val nextSubdomains = if (currentIndex != -1) {
+                subdomains.subList(currentIndex + 1, subdomains.size)
+            } else {
+                subdomains
+            }
+
+            var latestResponse = response
+            for (nextPrefix in nextSubdomains) {
+                latestResponse.close()
+                val newUrl = url.newBuilder()
+                    .host("$nextPrefix.nhentai.net")
+                    .build()
+                val newRequest = originalRequest.newBuilder()
+                    .url(newUrl)
+                    .build()
+                latestResponse = chain.proceed(newRequest)
+                if (latestResponse.isSuccessful) return latestResponse
+                if (latestResponse.code != 404) return latestResponse
+            }
+
+            return latestResponse
+        }
+    }
 
     companion object {
         const val PREFIX_ID_SEARCH = "id:"

@@ -9,11 +9,7 @@ import kotlinx.serialization.Serializable
 //  CDN Config
 // ─────────────────────────────────────────────────────────────
 
-@Serializable
-data class CdnConfigResponse(
-    @SerialName("image_servers") val imageServers: List<String>,
-    @SerialName("thumb_servers") val thumbServers: List<String>,
-)
+// Deleted CdnConfigResponse
 
 // ─────────────────────────────────────────────────────────────
 //  Gallery List (search / browse / popular / latest)
